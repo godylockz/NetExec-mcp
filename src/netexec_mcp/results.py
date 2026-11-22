@@ -48,8 +48,8 @@ class StatusRecord:
     # On `[+]` auth lines only: "pwned" (privilege label), "guest_fallback" ((Guest) -- the
     # credential is INVALID, the server granted a guest/null session), or "valid". None else.
     auth: str | None = None
-    # On `[-]`/`[!]` lines carrying a known TERMINAL signature (a ticket/credential that will
-    # never work as-is): "auth_error" | "op_error". None otherwise.
+    # On `[-]`/`[!]` lines carrying a known failure signature: "auth_error" | "op_error" |
+    # "rdp_operation_failed". None otherwise.
     error_class: str | None = None
     terminal: bool = False
 
@@ -74,22 +74,35 @@ _AUTH_CRED_RE = re.compile(r"^(?![A-Z]+EXEC:)[^:\s()]+:")
 _NO_SECRET_AUTH_RE = re.compile(
     r"^(?P<who>[^\s:()]+)\s+(?:from (?:certificate|ccache)"
     r"|through S4U(?:\+U2U)? with \S+(?: \(w/ SPN [^)]*\))?)(?=\s|$)", re.IGNORECASE)
-# Terminal failure signatures: the ticket/credential will NOT work on a plain retry (re-forge
-# or change credential). Conservative: NO bare STATUS_ACCESS_DENIED (benign, e.g. a guest that
-# cannot list shares), and NO transient errors -- KRB_AP_ERR_SKEW (fix the clock) and
-# STATUS_ACCOUNT_LOCKED_OUT (unlocks after the lockout window) are deliberately excluded.
-_TERMINAL_SIGNATURES = (
-    ("auth_error", re.compile(
+# Failure signatures. Terminal means a plain retry will not help. Conservative: NO bare
+# STATUS_ACCESS_DENIED (benign, e.g. a guest that cannot list shares). Clock skew is an
+# authentication failure but remains non-terminal because correcting the clock fixes it.
+_FAILURE_SIGNATURES = (
+    ("auth_error", True, re.compile(
         r"KDC_ERR_(?:TGT_REVOKED|WRONG_REALM|CLIENT_REVOKED|C_PRINCIPAL_UNKNOWN|PREAUTH_FAILED)"
         r"|WRONG_REALM|STATUS_USER_SESSION_DELETED"
         r"|STATUS_ACCOUNT_DISABLED|STATUS_PASSWORD_EXPIRED|KRB_AP_ERR_MODIFIED"
-        r"|KRB_AP_ERR_TKT_EXPIRED", re.I)),
-    ("op_error", re.compile(r"rpc_s_access_denied|DRSUAPI.*denied|DCSync.*denied", re.I)),
+        r"|KRB_AP_ERR_TKT_EXPIRED", re.IGNORECASE)),
+    ("op_error", True, re.compile(
+        r"rpc_s_access_denied|DRSUAPI.*denied|DCSync.*denied", re.IGNORECASE)),
+    ("auth_error", False, re.compile(
+        r"KRB_AP_ERR_SKEW|clock skew too great", re.IGNORECASE)),
+    ("rdp_operation_failed", True, re.compile(
+        r"RDP session disconnected before command execution; -x/-X was not run"
+        r"|RDP session disconnected before screenshot capture; --screenshot was not run"
+        r"|Connection was reset by the remote host", re.IGNORECASE)),
 )
+_ERROR_ADVICE = {
+    "rdp_operation_failed": (
+        "RDP authenticated, but the requested operation did not complete; use another "
+        "execution path or establish a stable desktop session"
+    ),
+}
 # A saved Kerberos ticket (getST/S4U/ticketer): a real success even when sibling hosts fail.
 # Requires the save VERB (no bare `.ccache` catch-all, which matched any line merely NAMING a
 # cache path -- incl. a failure line -- and falsely flipped a terminal error to "success").
-_TICKET_SAVED_RE = re.compile(r"sav(?:ed|ing)\b.*(?:\.ccache|\.kirbi|ticket)", re.I)
+_TICKET_SAVED_RE = re.compile(
+    r"sav(?:ed|ing)\b.*(?:\.ccache|\.kirbi|ticket)", re.IGNORECASE)
 
 
 def _auth_label(marker: str, message: str, pwn3d_label: str) -> str | None:
@@ -117,12 +130,14 @@ def _is_auth_line(message: str) -> bool:
     return bool(_AUTH_CRED_RE.match(message) or _NO_SECRET_AUTH_RE.match(message))
 
 
-def _error_tag(marker: str, message: str) -> tuple[str | None, bool]:
-    """Classify a failure line against the terminal-signature table."""
+def _error_tag(marker: str, message: str, protocol: str | None = None) -> tuple[str | None, bool]:
+    """Classify a failure line against the failure-signature table."""
     if marker in ("-", "!"):
-        for cls, rx in _TERMINAL_SIGNATURES:
+        for cls, terminal, rx in _FAILURE_SIGNATURES:
+            if cls == "rdp_operation_failed" and (protocol or "").casefold() != "rdp":
+                continue
             if rx.search(message):
-                return cls, True
+                return cls, terminal
     return None, False
 
 
@@ -166,7 +181,7 @@ def parse_markers(text: str, pwn3d_label: str = "Pwn3d!") -> list[StatusRecord]:
         if full:
             marker = full["marker"]
             message = full["message"].strip()
-            error_class, terminal = _error_tag(marker, message)
+            error_class, terminal = _error_tag(marker, message, full["proto"])
             records.append(
                 StatusRecord(
                     status=_STATUS[marker],
@@ -235,12 +250,17 @@ def build_verdict(records, returncode=None, unparsed_lines=0, stderr=""):
             authenticated.append({"host": r.host, "user": _user_from_message(r.message), "pwned": False})
         elif r.auth == "guest_fallback":
             guest_only.append({"host": r.host, "user": _user_from_message(r.message)})
-        if r.marker in ("-", "!") and _is_auth_line(r.message):
+        if r.marker in ("-", "!") and (
+            _is_auth_line(r.message) or r.error_class == "auth_error"
+        ):
             auth_failed.append({"host": r.host, "user": _user_from_message(r.message)})
         if r.terminal:
             errors.append({
                 "host": r.host, "error_class": r.error_class, "message": r.message,
-                "advice": "retrying as-is will not succeed; re-forge or use another credential",
+                "advice": _ERROR_ADVICE.get(
+                    r.error_class,
+                    "retrying as-is will not succeed; re-forge or use another credential",
+                ),
             })
         if r.marker == "+" and _TICKET_SAVED_RE.search(r.message):
             ticket_saved = True       # only a POSITIVE line saves a ticket, never a failure line
@@ -255,9 +275,18 @@ def build_verdict(records, returncode=None, unparsed_lines=0, stderr=""):
         "pwned": any(a.get("pwned") for a in authenticated),
         "empty": returncode == 0 and not records and unparsed_lines == 0 and not (stderr or "").strip(),
     }
-    op_error = errors[0]["error_class"] if errors else None
-    op_error_note = errors[0]["advice"] if errors else None
-    if any_success:
+    rdp_errors = [e for e in errors if e["error_class"] == "rdp_operation_failed"]
+    authenticated_hosts = {a["host"] for a in authenticated}
+    rdp_error_hosts = {e["host"] for e in rdp_errors}
+    rdp_operation_failed = bool(rdp_errors) and (
+        None in rdp_error_hosts or not authenticated_hosts - rdp_error_hosts
+    )
+    primary_error = rdp_errors[0] if rdp_operation_failed else (errors[0] if errors else None)
+    op_error = primary_error["error_class"] if primary_error else None
+    op_error_note = primary_error["advice"] if primary_error else None
+    if rdp_operation_failed:
+        outcome_class = "op_error"
+    elif any_success:
         outcome_class = "success"                 # never bury a success under a sibling failure
     elif op_error:
         outcome_class = "op_error"

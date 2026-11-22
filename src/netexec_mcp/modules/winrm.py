@@ -10,16 +10,10 @@ ports 5985/5986) is the post-credential exec/pivot surface. The tools span:
     command execution (cmd / PowerShell), credential dumping (sam/lsa/dpapi/klist), and
     file get/put.
 
-**Auth model -- NTLM only.** Unlike SMB/LDAP, nxc's WinRM connection implements
-only ``plaintext_login`` and ``hash_login`` (the handler explicitly notes "nxc
-winrm only support NTLM currently"; the base ``kerberos_login`` is a no-op for
-this protocol). So these tools intentionally expose **only** the credential
-parameters WinRM can honour -- user/pass, ``-H`` NTLM hash (pass-the-hash),
-``-d`` domain, ``--local-auth``, ``--laps``, and stored ``cred_id`` -- and omit
-Kerberos / aesKey / ccache / certificate (those flags are accepted by argparse
-but silently ignored by the WinRM handler). The WinRM-specific transport knobs
-``--port`` / ``--check-proto`` / ``--http-timeout`` are exposed for non-default
-deployments.
+**Auth model.** WinRM supports NTLM password/hash authentication and Kerberos
+password/ccache authentication. Kerberos AES keys and certificates are not
+supported by the WinRM transport. The WinRM-specific transport knobs ``--port`` /
+``--check-proto`` / ``--http-timeout`` are exposed for non-default deployments.
 """
 
 from __future__ import annotations
@@ -27,11 +21,22 @@ from __future__ import annotations
 import contextlib
 
 from ..auth import build_auth_flags
-from ..config import (KLIST_DUMP_LOCK, download_target, klist_ccaches, klist_count_note,
-                      klist_snapshot, report_download)
+from ..config import (
+    KLIST_DUMP_LOCK,
+    download_target,
+    klist_ccaches,
+    klist_count_note,
+    klist_snapshot,
+    report_download,
+)
 from ..executor import execute
-from ..results import (klist_failures, parse_klist_dumps, parse_klist_sessions, parse_lsa_secrets,
-                       parse_secretsdump)
+from ..results import (
+    klist_failures,
+    parse_klist_dumps,
+    parse_klist_sessions,
+    parse_lsa_secrets,
+    parse_secretsdump,
+)
 
 
 async def _winrm_run(
@@ -50,20 +55,24 @@ async def _winrm_run(
     ntlm_hash=None,
     domain=None,
     local_auth=False,
+    kerberos=False,
+    use_kcache=False,
+    kdc_host=None,
+    ccache=None,
     cred_id=None,
     laps=None,
 ) -> dict:
-    """Build auth + transport + action flags and run against the winrm protocol.
-
-    WinRM is NTLM-only, so the auth surface here is deliberately the SMB set minus
-    Kerberos/cert (see module docstring).
-    """
+    """Build auth + transport + action flags and run against the WinRM protocol."""
     auth = build_auth_flags(
         username=username,
         password=password,
         ntlm_hash=ntlm_hash,
         domain=domain,
         local_auth=local_auth,
+        kerberos=kerberos,
+        use_kcache=use_kcache,
+        kdc_host=kdc_host,
+        ccache=ccache,
         cred_id=cred_id,
         laps=laps,
     )
@@ -75,7 +84,8 @@ async def _winrm_run(
     if http_timeout is not None:
         transport += ["--http-timeout", str(http_timeout)]
     extra = auth + transport + list(action_flags) + list(extra_flags or [])
-    outcome = await execute(get_config(), "winrm", targets, extra, offensive=offensive, dump=dump)
+    outcome = await execute(
+        get_config(), "winrm", targets, extra, offensive=offensive, dump=dump, ccache=ccache)
     return outcome.to_dict()
 
 
@@ -95,6 +105,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -103,14 +117,14 @@ def register(mcp, get_config) -> None:
         Reports OS/domain and the auth result (`[+]`, with `Pwn3d!` when the account can
         open a remote shell). Pass credentials to authenticate, or none to probe whether
         WinRM is enabled. `port`/`check_proto` override the default 5985/5986 + http/https
-        probe; `http_timeout` the per-connection HTTP timeout. WinRM auth is NTLM-only
-        (user/pass or `ntlm_hash`).
+        probe; `http_timeout` the per-connection HTTP timeout. WinRM accepts NTLM
+        user/password or hash authentication and Kerberos password/ccache authentication.
         """
         return await _winrm_run(
             get_config, [], targets, port=port, check_proto=check_proto,
             http_timeout=http_timeout, username=username, password=password,
-            ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth, cred_id=cred_id,
-            laps=laps,
+            ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth, kerberos=kerberos,
+            use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache, cred_id=cred_id, laps=laps,
         )
 
     @mcp.tool()
@@ -125,6 +139,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -138,8 +156,8 @@ def register(mcp, get_config) -> None:
         return await _winrm_run(
             get_config, flags, targets, port=port, check_proto=check_proto,
             http_timeout=http_timeout, username=username, password=password,
-            ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth, cred_id=cred_id,
-            laps=laps,
+            ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth, kerberos=kerberos,
+            use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache, cred_id=cred_id, laps=laps,
         )
 
     # ---- Offensive (loot for read-only credential/file harvest; full for write/exec) ---- #
@@ -159,6 +177,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -179,8 +201,8 @@ def register(mcp, get_config) -> None:
         return await _winrm_run(
             get_config, flags, targets, offensive=True, port=port, check_proto=check_proto,
             http_timeout=http_timeout, username=username, password=password,
-            ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth, cred_id=cred_id,
-            laps=laps,
+            ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth, kerberos=kerberos,
+            use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache, cred_id=cred_id, laps=laps,
         )
 
     @mcp.tool()
@@ -195,6 +217,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -209,6 +235,7 @@ def register(mcp, get_config) -> None:
             get_config, ["--sam"], targets, offensive=True, dump=True, extra_flags=extra, port=port,
             check_proto=check_proto, http_timeout=http_timeout, username=username,
             password=password, ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth,
+            kerberos=kerberos, use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache,
             cred_id=cred_id, laps=laps,
         )
         result["credentials"] = parse_secretsdump(result["stdout"])
@@ -226,6 +253,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -241,6 +272,7 @@ def register(mcp, get_config) -> None:
             get_config, ["--lsa"], targets, offensive=True, dump=True, extra_flags=extra, port=port,
             check_proto=check_proto, http_timeout=http_timeout, username=username,
             password=password, ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth,
+            kerberos=kerberos, use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache,
             cred_id=cred_id, laps=laps,
         )
         result["secrets"] = parse_lsa_secrets(result["stdout"])
@@ -257,6 +289,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
         modes: list[str] | None = None,
@@ -287,6 +323,7 @@ def register(mcp, get_config) -> None:
             get_config, flags, targets, offensive=True, dump=True, extra_flags=extra, port=port,
             check_proto=check_proto, http_timeout=http_timeout, username=username,
             password=password, ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth,
+            kerberos=kerberos, use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache,
             cred_id=cred_id, laps=laps,
         )
 
@@ -303,6 +340,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -310,10 +351,9 @@ def register(mcp, get_config) -> None:
 
         Without `dump`, returns `sessions` (`{host, index, account, logon_id, expires}`).
         `dump=true` saves each TGT as a ccache file on the nxc host and returns `tickets`
-        (`{host, principal, logon_id, ccache}`): pass a `ccache` path as the `ccache`
-        parameter of an SMB or LDAP tool to act as that account (WinRM logins here are
-        NTLM-only). `sessions` takes `index` numbers from a listing to dump only those, and
-        implies `dump`.
+        (`{host, principal, logon_id, ccache}`): pass a `ccache` path to an SMB, LDAP, or
+        WinRM tool to act as that account. `sessions` takes `index` numbers from a listing
+        to dump only those, and implies `dump`.
 
         `klist_failures` lists klist's own errors per host: an empty `sessions`/`tickets` next to
         one means klist did not run, not that no ticket is cached. Session numbers are per host
@@ -332,6 +372,7 @@ def register(mcp, get_config) -> None:
                 get_config, flags, targets, offensive=True, dump=True, port=port,
                 check_proto=check_proto, http_timeout=http_timeout, username=username,
                 password=password, ntlm_hash=ntlm_hash, domain=domain, local_auth=local_auth,
+                kerberos=kerberos, use_kcache=use_kcache, kdc_host=kdc_host, ccache=ccache,
                 cred_id=cred_id, laps=laps,
             )
         if dump:
@@ -357,6 +398,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -375,7 +420,8 @@ def register(mcp, get_config) -> None:
             get_config, ["--get-file", remote_path, abs_path], targets, offensive=True, dump=True,
             port=port, check_proto=check_proto, http_timeout=http_timeout,
             username=username, password=password, ntlm_hash=ntlm_hash, domain=domain,
-            local_auth=local_auth, cred_id=cred_id, laps=laps,
+            local_auth=local_auth, kerberos=kerberos, use_kcache=use_kcache,
+            kdc_host=kdc_host, ccache=ccache, cred_id=cred_id, laps=laps,
         )
         return report_download(result, get_config(), abs_path, was_rel)
 
@@ -392,6 +438,10 @@ def register(mcp, get_config) -> None:
         ntlm_hash: str | None = None,
         domain: str | None = None,
         local_auth: bool = False,
+        kerberos: bool = False,
+        use_kcache: bool = False,
+        kdc_host: str | None = None,
+        ccache: str | None = None,
         cred_id: int | None = None,
         laps: str | None = None,
     ) -> dict:
@@ -406,5 +456,6 @@ def register(mcp, get_config) -> None:
             get_config, ["--put-file", local_path, remote_path], targets, offensive=True,
             port=port, check_proto=check_proto, http_timeout=http_timeout,
             username=username, password=password, ntlm_hash=ntlm_hash, domain=domain,
-            local_auth=local_auth, cred_id=cred_id, laps=laps,
+            local_auth=local_auth, kerberos=kerberos, use_kcache=use_kcache,
+            kdc_host=kdc_host, ccache=ccache, cred_id=cred_id, laps=laps,
         )
