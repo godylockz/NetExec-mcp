@@ -79,7 +79,8 @@ _NO_SECRET_AUTH_RE = re.compile(
 # authentication failure but remains non-terminal because correcting the clock fixes it.
 _FAILURE_SIGNATURES = (
     ("auth_error", True, re.compile(
-        r"KDC_ERR_(?:TGT_REVOKED|WRONG_REALM|CLIENT_REVOKED|C_PRINCIPAL_UNKNOWN|PREAUTH_FAILED)"
+        r"KDC_ERR_(?:TGT_REVOKED|WRONG_REALM|CLIENT_REVOKED|C_PRINCIPAL_UNKNOWN|"
+        r"PREAUTH_FAILED|CLIENT_NAME_MISMATCH)"
         r"|WRONG_REALM|STATUS_USER_SESSION_DELETED"
         r"|STATUS_ACCOUNT_DISABLED|STATUS_PASSWORD_EXPIRED|KRB_AP_ERR_MODIFIED"
         r"|KRB_AP_ERR_TKT_EXPIRED", re.IGNORECASE)),
@@ -281,7 +282,14 @@ def build_verdict(records, returncode=None, unparsed_lines=0, stderr=""):
     rdp_operation_failed = bool(rdp_errors) and (
         None in rdp_error_hosts or not authenticated_hosts - rdp_error_hosts
     )
-    primary_error = rdp_errors[0] if rdp_operation_failed else (errors[0] if errors else None)
+    operation_errors = [
+        error for error in errors if error["error_class"] != "auth_error"
+    ]
+    primary_error = (
+        rdp_errors[0]
+        if rdp_operation_failed
+        else (operation_errors[0] if operation_errors else None)
+    )
     op_error = primary_error["error_class"] if primary_error else None
     op_error_note = primary_error["advice"] if primary_error else None
     if rdp_operation_failed:

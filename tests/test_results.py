@@ -21,6 +21,22 @@ def test_clock_skew_is_authentication_failure():
     assert op_error is None
 
 
+def test_terminal_kerberos_failures_are_authentication_failures():
+    for signature in (
+        "KDC_ERR_PREAUTH_FAILED(Pre-authentication information was invalid)",
+        "KDC_ERR_CLIENT_NAME_MISMATCH(Reserved for PKINIT)",
+    ):
+        records, (_, outcome_class, op_error, _) = verdict_for(
+            "RDP 192.0.2.10 3389 SRV01 [-] Failed to get a TGT with the certificate: "
+            f"Kerberos SessionError: {signature}"
+        )
+
+        assert records[0].error_class == "auth_error"
+        assert records[0].terminal is True
+        assert outcome_class == "auth_failed"
+        assert op_error is None
+
+
 def test_disconnected_rdp_execution_overrides_authentication_success():
     _, (verdict, outcome_class, op_error, op_error_note) = verdict_for(
         r"""RDP 192.0.2.10 3389 SRV01 [+] EXAMPLE\alice from ccache
